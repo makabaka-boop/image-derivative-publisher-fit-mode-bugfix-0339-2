@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     crop_y      INTEGER NOT NULL,
     crop_w      INTEGER NOT NULL,
     crop_h      INTEGER NOT NULL,
+    fit         TEXT NOT NULL CHECK (fit IN ('contain','cover'))
+                       DEFAULT 'contain',
     status      TEXT NOT NULL CHECK (status IN
                     ('pending','processing','published','cancelled','superseded','failed')),
     error       TEXT,
@@ -50,9 +52,11 @@ CREATE TABLE IF NOT EXISTS versions (
     crop_y      INTEGER NOT NULL,
     crop_w      INTEGER NOT NULL,
     crop_h      INTEGER NOT NULL,
+    fit         TEXT NOT NULL CHECK (fit IN ('contain','cover'))
+                       DEFAULT 'contain',
     version_no  INTEGER NOT NULL,
     created_at  TEXT NOT NULL,
-    UNIQUE (image_id, crop_x, crop_y, crop_w, crop_h)
+    UNIQUE (image_id, crop_x, crop_y, crop_w, crop_h, fit)
 );
 CREATE INDEX IF NOT EXISTS idx_versions_image ON versions(image_id);
 
@@ -87,12 +91,70 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_fit(conn: sqlite3.Connection) -> None:
+    """为旧库增加 fit，并让“完整画面/居中方形”成为版本身份的一部分。"""
+    if "fit" not in _columns(conn, "jobs"):
+        conn.execute(
+            "ALTER TABLE jobs ADD COLUMN fit TEXT NOT NULL DEFAULT 'contain'"
+        )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_jobs_request
+            ON jobs(image_id, crop_x, crop_y, crop_w, crop_h, fit)
+        """
+    )
+
+    if "fit" in _columns(conn, "versions"):
+        return
+
+    conn.execute(
+        "ALTER TABLE versions ADD COLUMN fit TEXT NOT NULL DEFAULT 'contain'"
+    )
+    # SQLite 不能直接改 UNIQUE 约束；在 foreign_keys=OFF 下重建表。
+    conn.execute(
+        """
+        CREATE TABLE versions_new (
+            id          TEXT PRIMARY KEY,
+            image_id    TEXT NOT NULL REFERENCES images(id),
+            crop_x      INTEGER NOT NULL,
+            crop_y      INTEGER NOT NULL,
+            crop_w      INTEGER NOT NULL,
+            crop_h      INTEGER NOT NULL,
+            fit         TEXT NOT NULL CHECK (fit IN ('contain','cover')),
+            version_no  INTEGER NOT NULL,
+            created_at  TEXT NOT NULL,
+            UNIQUE (image_id, crop_x, crop_y, crop_w, crop_h, fit)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO versions_new
+            (id, image_id, crop_x, crop_y, crop_w, crop_h, fit,
+             version_no, created_at)
+        SELECT id, image_id, crop_x, crop_y, crop_w, crop_h, fit,
+               version_no, created_at
+          FROM versions
+        """
+    )
+    conn.execute("DROP TABLE versions")
+    conn.execute("ALTER TABLE versions_new RENAME TO versions")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_versions_image ON versions(image_id)"
+    )
+
+
 def init_db() -> None:
     conn = connect()
     try:
         # 建表顺序里 images 引用了 versions，需先关掉外键再执行整段脚本。
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.executescript(SCHEMA)
+        _migrate_fit(conn)
         conn.execute("PRAGMA foreign_keys=ON")
     finally:
         conn.close()

@@ -15,6 +15,8 @@ from typing import Any
 
 from . import config, db, imaging, storage
 
+FITS = ("contain", "cover")
+
 
 class ServiceError(Exception):
     def __init__(self, message: str, status: int = 400, code: str = "bad_request"):
@@ -31,9 +33,20 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def spec_key(sha256_hex: str, box: tuple[int, int, int, int], target: int) -> str:
+def validate_fit(fit: str) -> str:
+    if fit not in FITS:
+        raise ServiceError("fit 必须是 contain 或 cover")
+    return fit
+
+
+def spec_key(
+    sha256_hex: str,
+    box: tuple[int, int, int, int],
+    target: int,
+    fit: str = "contain",
+) -> str:
     x, y, w, h = box
-    raw = f"{sha256_hex}|{x},{y},{w},{h}|{target}".encode()
+    raw = f"{sha256_hex}|{x},{y},{w},{h}|{fit}|{target}".encode()
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -140,9 +153,8 @@ def submit_job(
     test_delay_ms: int = 0,
     fit: str = "contain",
 ) -> dict[str, Any]:
+    validate_fit(fit)
     x, y, w, h = box
-    if fit not in ("contain", "cover"):
-        raise ServiceError("fit 必须是 contain 或 cover")
     with db.tx() as conn:
         image = conn.execute(
             "SELECT * FROM images WHERE id=?", (image_id,)
@@ -153,21 +165,26 @@ def submit_job(
         imaging.validate_crop(info, x, y, w, h)
 
         ts = now()
+        request_filter = """
+            image_id=? AND crop_x=? AND crop_y=? AND crop_w=? AND crop_h=?
+              AND fit=?
+        """
+        request_values = (image_id, x, y, w, h, fit)
 
-        # 1) 相同原图摘要 + 相同裁切参数：复用已完成版本，立即返回 published。
+        # 1) 相同原图摘要 + 相同裁切参数和适配方式：复用已完成版本，立即 published。
         version = conn.execute(
-            """SELECT * FROM versions
-                WHERE image_id=? AND crop_x=? AND crop_y=? AND crop_w=? AND crop_h=?""",
-            (image_id, x, y, w, h),
+            f"""SELECT * FROM versions
+                 WHERE {request_filter}""",
+            request_values,
         ).fetchone()
         if version is not None:
             job_id = _uuid()
             conn.execute(
                 """INSERT INTO jobs
-                   (id, image_id, crop_x, crop_y, crop_w, crop_h, status,
+                   (id, image_id, crop_x, crop_y, crop_w, crop_h, fit, status,
                     version_id, test_delay_ms, worker_id, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,'published', ?, ?, NULL, ?, ?)""",
-                (job_id, image_id, x, y, w, h, version["id"], 0, ts, ts),
+                   VALUES (?,?,?,?,?,?,?, 'published', ?, ?, NULL, ?, ?)""",
+                (job_id, image_id, x, y, w, h, fit, version["id"], 0, ts, ts),
             )
             conn.execute(
                 "UPDATE images SET current_version_id=?, current_job_id=? WHERE id=?",
@@ -177,13 +194,13 @@ def submit_job(
             return {"http_status": 200, "reused": True,
                     "job": _serialize_job(conn, row)}
 
-        # 2) 同参数已有在途作业：直接复用，不新建。
+        # 2) 同请求已有在途作业：直接复用，不新建。
         inflight = conn.execute(
-            """SELECT * FROM jobs
-                WHERE image_id=? AND crop_x=? AND crop_y=? AND crop_w=? AND crop_h=?
-                  AND status IN ('pending','processing')
-                ORDER BY created_at DESC LIMIT 1""",
-            (image_id, x, y, w, h),
+            f"""SELECT * FROM jobs
+                 WHERE {request_filter}
+                   AND status IN ('pending','processing')
+                 ORDER BY created_at DESC LIMIT 1""",
+            request_values,
         ).fetchone()
         if inflight is not None:
             conn.execute(
@@ -193,15 +210,15 @@ def submit_job(
             return {"http_status": 202, "reused": True,
                     "job": _serialize_job(conn, inflight)}
 
-        # 3) 新参数：新建 pending 作业，成为当前选择。
+        # 3) 新请求：新建 pending 作业，成为当前选择。
         # 旧的已发布版本继续保留展示，只移动当前作业指针。
         job_id = _uuid()
         conn.execute(
             """INSERT INTO jobs
-               (id, image_id, crop_x, crop_y, crop_w, crop_h, status,
+               (id, image_id, crop_x, crop_y, crop_w, crop_h, fit, status,
                 version_id, test_delay_ms, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,'pending', NULL, ?, ?, ?)""",
-            (job_id, image_id, x, y, w, h, test_delay_ms, ts, ts),
+               VALUES (?,?,?,?,?,?,?, 'pending', NULL, ?, ?, ?)""",
+            (job_id, image_id, x, y, w, h, fit, test_delay_ms, ts, ts),
         )
         conn.execute(
             "UPDATE images SET current_job_id=? WHERE id=?", (job_id, image_id)
@@ -321,6 +338,8 @@ def claim_job(worker_id: str) -> dict[str, Any] | None:
 def process_job(job: dict[str, Any], stop: threading.Event | None = None) -> str:
     """渲染两个尺寸并一次性发布。返回最终状态。"""
     job_id = job["id"]
+    fit = job.get("fit", "contain")
+    validate_fit(fit)
     with db.connect() as conn:
         image = conn.execute(
             "SELECT * FROM images WHERE id=?", (job["image_id"],)
@@ -338,9 +357,9 @@ def process_job(job: dict[str, Any], stop: threading.Event | None = None) -> str
             if interruptible_sleep(slice_, stop):
                 return _abandoned(job_id)
             webp, out_w, out_h = imaging.render_webp(
-                data, image["format"], box, target
+                data, image["format"], box, target, fit
             )
-            key = spec_key(image["sha256"], box, target)
+            key = spec_key(image["sha256"], box, target, fit)
             tmp = config.TMP_DIR / f"{key}.staging-{job_id}-{target}"
             storage.write_staged_deriv(tmp, webp)
             staged.append({"size": target, "key": key, "tmp": tmp,
@@ -407,20 +426,21 @@ def publish_rendered(job_id: str, staged: list[dict[str, Any]]) -> str:
                 version_id = _uuid()
                 conn.execute(
                     """INSERT OR IGNORE INTO versions
-                       (id, image_id, crop_x, crop_y, crop_w, crop_h,
+                       (id, image_id, crop_x, crop_y, crop_w, crop_h, fit,
                         version_no, created_at)
-                       VALUES (?,?,?,?,?,?,
+                       VALUES (?,?,?,?,?,?,?,
                           (SELECT COALESCE(MAX(version_no),0)+1 FROM versions
                             WHERE image_id=?), ?)""",
                     (version_id, row["image_id"], row["crop_x"], row["crop_y"],
-                     row["crop_w"], row["crop_h"], row["image_id"], ts),
+                     row["crop_w"], row["crop_h"], row["fit"],
+                     row["image_id"], ts),
                 )
                 version = conn.execute(
                     """SELECT * FROM versions
                         WHERE image_id=? AND crop_x=? AND crop_y=?
-                          AND crop_w=? AND crop_h=?""",
+                          AND crop_w=? AND crop_h=? AND fit=?""",
                     (row["image_id"], row["crop_x"], row["crop_y"],
-                     row["crop_w"], row["crop_h"]),
+                     row["crop_w"], row["crop_h"], row["fit"]),
                 ).fetchone()
                 version_id = version["id"]
 
@@ -494,6 +514,7 @@ def _version_payload(conn: sqlite3.Connection, version_id: str | None) -> dict |
     return {
         "id": version["id"],
         "version_no": version["version_no"],
+        "fit": version["fit"],
         "crop": {"x": version["crop_x"], "y": version["crop_y"],
                  "w": version["crop_w"], "h": version["crop_h"]},
         "created_at": version["created_at"],
@@ -506,6 +527,7 @@ def _serialize_job(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "id": row["id"],
         "image_id": row["image_id"],
         "status": row["status"],
+        "fit": row["fit"],
         "crop": {"x": row["crop_x"], "y": row["crop_y"],
                  "w": row["crop_w"], "h": row["crop_h"]},
         "error": row["error"],
@@ -525,6 +547,7 @@ def _serialize_image(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, An
             current_job = {
                 "id": j["id"],
                 "status": j["status"],
+                "fit": j["fit"],
                 "crop": {"x": j["crop_x"], "y": j["crop_y"],
                          "w": j["crop_w"], "h": j["crop_h"]},
             }

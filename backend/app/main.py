@@ -97,8 +97,6 @@ def create_job(
         if not (0 <= x_test_delay_ms <= config.MAX_TEST_DELAY_MS):
             raise HTTPException(status_code=400, detail="延迟参数超出范围")
         delay = x_test_delay_ms
-    if crop.fit not in ("contain", "cover"):
-        raise HTTPException(status_code=400, detail="fit 必须是 contain 或 cover")
     result = service.submit_job(
         image_id, (crop.x, crop.y, crop.w, crop.h), test_delay_ms=delay,
         fit=crop.fit,

@@ -117,6 +117,94 @@ def test_concurrent_identical_requests_share_single_job(client):
     assert again.json()["job"]["version"]["id"] == only["version"]["id"]
 
 
+def test_same_crop_with_different_fit_owns_separate_versions(client):
+    # 使用独特色块，避免同一会话里的相同上传/裁切请求被内容寻址复用。
+    image = upload(client, make_png(800, 600, (12, 180, 96, 255))).json()["image"]
+    crop = {"x": 100, "y": 50, "w": 400, "h": 300}
+
+    contain_payload = {**crop, "fit": "contain"}
+    r1 = submit(client, image["id"], contain_payload)
+    assert r1.status_code == 202, r1.text
+    v1 = wait_job(client, r1.json()["job"]["id"])["version"]
+    assert v1["version_no"] == 1
+    assert v1["fit"] == "contain"
+    assert sorted((d["width"], d["height"]) for d in v1["derivatives"]) == [
+        (256, 192), (512, 384),
+    ]
+
+    # 同一裁切框但适配方式不同，是新请求，必须生成居中方形版本。
+    cover_payload = {**crop, "fit": "cover"}
+    r2 = submit(client, image["id"], cover_payload)
+    assert r2.status_code == 202, r2.text
+    job2 = r2.json()["job"]
+    assert job2["fit"] == "cover"
+    v2 = wait_job(client, job2["id"])["version"]
+    assert v2["version_no"] == 2
+    assert v2["id"] != v1["id"]
+    assert v2["fit"] == "cover"
+    for d in v2["derivatives"]:
+        assert (d["width"], d["height"]) == (d["size"], d["size"])
+
+    state = client.get(f"/api/images/{image['id']}").json()
+    assert state["current_version"]["id"] == v2["id"]
+    assert state["current_job"]["fit"] == "cover"
+
+    # 完全相同的 cover 请求复用 cover 版本，不生成 v3。
+    r3 = submit(client, image["id"], cover_payload)
+    assert r3.status_code == 200, r3.text
+    reused_cover = r3.json()["job"]
+    assert reused_cover["status"] == "published"
+    assert reused_cover["fit"] == "cover"
+    assert reused_cover["version"]["id"] == v2["id"]
+    assert reused_cover["version"]["version_no"] == 2
+
+    # 切回 contain 时仍复用原来的长方形 v1；适配方式是版本身份的一部分。
+    r4 = submit(client, image["id"], contain_payload)
+    assert r4.status_code == 200, r4.text
+    reused_contain = r4.json()["job"]
+    assert reused_contain["status"] == "published"
+    assert reused_contain["fit"] == "contain"
+    assert reused_contain["version"]["id"] == v1["id"]
+    assert reused_contain["version"]["version_no"] == 1
+    assert sorted((d["width"], d["height"]) for d in reused_contain["version"]["derivatives"]) == [
+        (256, 192), (512, 384),
+    ]
+    state = client.get(f"/api/images/{image['id']}").json()
+    assert state["current_version"]["id"] == v1["id"]
+    assert state["current_job"]["fit"] == "contain"
+
+
+def test_inflight_requests_are_shared_only_when_fit_matches(client):
+    image = upload(client, make_png(640, 480)).json()["image"]
+    crop = {"x": 20, "y": 20, "w": 300, "h": 200}
+
+    contain = submit(client, image["id"], {**crop, "fit": "contain"}, delay_ms=2000)
+    job_contain = contain.json()["job"]
+    assert contain.status_code == 202
+    assert job_contain["fit"] == "contain"
+
+    cover = submit(client, image["id"], {**crop, "fit": "cover"}, delay_ms=0)
+    job_cover = cover.json()["job"]
+    assert cover.status_code == 202
+    assert cover.json()["reused"] is False
+    assert job_cover["id"] != job_contain["id"]
+    assert job_cover["fit"] == "cover"
+
+    done_cover = wait_job(client, job_cover["id"])
+    assert done_cover["status"] == "published"
+    done_contain = wait_job(client, job_contain["id"], timeout=10)
+    # 用户已改选 cover；contain 迟到完成不能顶回当前选择，但成果仍归 contain。
+    assert done_contain["status"] == "superseded", done_contain
+    assert done_contain["version"]["id"] != done_cover["version"]["id"]
+
+    state = client.get(f"/api/images/{image['id']}").json()
+    assert state["current_version"]["id"] == done_cover["version"]["id"]
+
+    again = submit(client, image["id"], {**crop, "fit": "contain"})
+    assert again.status_code == 200
+    assert again.json()["job"]["version"]["id"] == done_contain["version"]["id"]
+
+
 def test_changed_crop_creates_new_version_and_old_remains(client):
     image = upload(client, make_png(700, 700)).json()["image"]
 

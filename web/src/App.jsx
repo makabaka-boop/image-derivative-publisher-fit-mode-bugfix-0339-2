@@ -11,6 +11,11 @@ const STATUS_LABEL = {
   failed: '失败',
 }
 
+const FIT_LABEL = {
+  contain: '保留完整裁切区域',
+  cover: '居中裁成方形',
+}
+
 async function api(path, options) {
   const res = await fetch(path, options)
   let body = null
@@ -29,6 +34,7 @@ async function api(path, options) {
 export default function App() {
   const [image, setImage] = useState(null)
   const [job, setJob] = useState(null)
+  const [fit, setFit] = useState('contain')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -42,7 +48,10 @@ export default function App() {
     if (fresh.current_job) {
       const j = await api(`/api/jobs/${fresh.current_job.id}`)
       // 只接受当前选择的作业；旧作业完成不得回写覆盖。
-      if (j.id === currentJobId.current) setJob(j)
+      if (j.id === currentJobId.current) {
+        setJob(j)
+        setFit(j.fit)
+      }
     }
     return fresh
   }, [])
@@ -81,6 +90,7 @@ export default function App() {
     setBusy(true)
     setImage(null)
     setJob(null)
+    setFit('contain')
     currentJobId.current = null
     try {
       const form = new FormData()
@@ -94,10 +104,11 @@ export default function App() {
     }
   }
 
-  const onSubmit = async (crop) => {
+  const onSubmit = async (crop, selectedFit) => {
     if (!image) return
     setError('')
     setBusy(true)
+    setFit(selectedFit)
     try {
       const body = await api(`/api/images/${image.id}/jobs`, {
         method: 'POST',
@@ -106,6 +117,7 @@ export default function App() {
       })
       currentJobId.current = body.job.id
       setJob(body.job)
+      setFit(body.job.fit)
       await refreshImage(image.id)
     } catch (e) {
       setError(e.message)
@@ -133,7 +145,7 @@ export default function App() {
         <h1>图片裁切派生</h1>
         <p className="hint">
           上传不超过 4 MiB 的 PNG/JPEG，选择裁切框，服务端生成 256 / 512 像素 WebP。
-          相同原图摘要与裁切参数会复用已完成结果；页面只展示已确认发布的版本。
+          相同原图摘要、裁切参数与适配方式会复用已完成结果；页面只展示已确认发布的版本。
         </p>
       </header>
 
@@ -150,7 +162,9 @@ export default function App() {
           imageId={image.id}
           width={image.width}
           height={image.height}
+          fit={fit}
           disabled={busy}
+          onFitChange={setFit}
           onSubmit={onSubmit}
         />
       )}
@@ -160,6 +174,9 @@ export default function App() {
           <h2>当前作业</h2>
           <p>
             状态：<strong>{STATUS_LABEL[job.status] || job.status}</strong>
+            {job.fit && (
+              <span className="crop-info"> · {FIT_LABEL[job.fit] || job.fit}</span>
+            )}
             {job.crop && (
               <span className="crop-info">
                 {' '}
@@ -180,6 +197,8 @@ export default function App() {
         <section className="result">
           <h2>已发布版本 v{image.current_version.version_no}</h2>
           <p className="crop-info">
+            适配方式：{FIT_LABEL[image.current_version.fit] || image.current_version.fit}
+            <br />
             裁切框：x={image.current_version.crop.x}, y={image.current_version.crop.y},
             w={image.current_version.crop.w}, h={image.current_version.crop.h}
           </p>
@@ -201,12 +220,11 @@ export default function App() {
   )
 }
 
-function Cropper({ imageId, width, height, disabled, onSubmit }) {
+function Cropper({ imageId, width, height, fit, disabled, onFitChange, onSubmit }) {
   const canvasRef = useRef(null)
   const imgRef = useRef(null)
   const [scale, setScale] = useState(1)
   const [sel, setSel] = useState(null)
-  const [fit, setFit] = useState('contain')
   const dragStart = useRef(null)
 
   const draw = useCallback(() => {
@@ -282,14 +300,14 @@ function Cropper({ imageId, width, height, disabled, onSubmit }) {
       w: Math.round(sel.w / scale),
       h: Math.round(sel.h / scale),
       fit,
-    })
+    }, fit)
   }
 
   return (
     <section className="cropper">
       <h2>选择裁切框</h2>
       <label>派生图适配方式：
-        <select value={fit} onChange={(event) => setFit(event.target.value)}>
+        <select value={fit} onChange={(event) => onFitChange(event.target.value)}>
           <option value="contain">保留完整裁切区域</option>
           <option value="cover">居中裁成方形</option>
         </select>

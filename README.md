@@ -50,9 +50,9 @@ docker-compose.yml
 ## 数据模型
 
 - `images`：原图，按 **sha256 内容寻址**，重复上传只产生一条记录。
-- `versions`：对 `(image_id, x, y, w, h)` 唯一。相同原图摘要 + 相同裁切参数
-  永远复用同一个版本；参数变化才产生递增 `version_no` 的新版本。
-- `derivatives`：单张 WebP 派生图，按 `sha256(原图摘要|裁切框|尺寸)` 内容寻址，
+- `versions`：对 `(image_id, x, y, w, h, fit)` 唯一。相同原图摘要 + 相同裁切参数
+  与适配方式永远复用同一个版本；裁切框或适配方式变化才产生递增 `version_no` 的新版本。
+- `derivatives`：单张 WebP 派生图，按 `sha256(原图摘要|裁切框|fit|尺寸)` 内容寻址，
   跨版本/跨作业共享。
 - `version_derivatives`：版本 ↔ 256/512 两张派生图（每档唯一）。
 - `jobs`：一次申请。状态机
@@ -65,9 +65,10 @@ docker-compose.yml
 
 申请作业（`POST /api/images/{id}/jobs`）在同一 `BEGIN IMMEDIATE` 事务内：
 
-1. 相同 `(原图摘要, 裁切参数)` 已有版本 → 直接生成一条 `published` 作业并指回该
-   版本（HTTP 200），不进 worker 队列；
-2. 否则同参数已有 `pending/processing` 作业 → 复用该作业（HTTP 202）；
+1. 相同 `(原图摘要, 裁切参数, fit)` 已有版本 → 直接生成一条 `published` 作业并指回
+   该版本（HTTP 200），不进 worker 队列；
+2. 否则同裁切框、同 fit 已有 `pending/processing` 作业 → 复用该作业（HTTP 202）；
+   仅 fit 不同属于不同请求，必须创建独立作业和版本；
 3. 否则新建 pending 作业（HTTP 202），成为 `current_job_id`；旧已发布版本保留展示。
 
 ### 两尺寸原子发布
@@ -111,7 +112,9 @@ worker 启动时先清空 `tmp/`，再把所有 `processing` 作业无条件退�
   字节必须能被 Pillow 实际解码且格式一致，伪装的 HTML/GIF/截断图一律 400。
 - 裁切：整数、宽高为正、起点非负、`x+w ≤ width`、`y+h ≤ height`，越界 400；
   恰好贴边允许。
-- 输出：裁切框等比缩放到最长边恰为 256/512（小图允许放大），WebP quality 85。
+- 输出：`contain` 保留完整裁切区域，裁切框等比缩放到最长边恰为 256/512；
+  `cover` 先从裁切区域中心取方形，再输出 256×256 / 512×512（小图允许放大），
+  WebP quality 85。
 
 ## HTTP 摘要
 
@@ -130,8 +133,8 @@ worker 启动时先清空 `tmp/`，再把所有 `processing` 作业无条件退�
 `docker compose run --rm verify` 在一次性容器里对完整 api+worker 栈执行
 pytest（约 30 秒）：
 
-- **重复申请**：相同上传去重、相同参数复用版本、并发 4 个相同申请只产生一个
-  在途作业、参数改变产生 v2、切回旧参数复用 v1；
+- **重复申请**：相同上传去重、相同裁切框+fit 复用版本、并发 4 个相同请求只产生一个
+  在途作业、参数或适配方式改变产生 v2、切回旧参数复用 v1；
 - **坏图**：随机字节、空文件、伪装 HTML、MIME 不符、GIF、超过 4 MiB；
 - **裁切越界**：负坐标/零宽/越界等 6 种非法框拒绝，贴边框允许，非整数 422；
 - **取消竞态**：取消先于完成（保持 cancelled）、完成后取消（409）、重复取消幂等；

@@ -79,6 +79,13 @@ def test_crop_non_integer_rejected(client):
     assert r.status_code == 422
 
 
+def test_unknown_fit_rejected(client):
+    image = upload(client, make_png(100, 100)).json()["image"]
+    r = submit(client, image["id"], {"x": 0, "y": 0, "w": 10, "h": 10, "fit": "stretch"})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "bad_request"
+
+
 def test_submit_for_missing_image_404(client):
     r = submit(client, "deadbeef", {"x": 0, "y": 0, "w": 10, "h": 10})
     assert r.status_code == 404
