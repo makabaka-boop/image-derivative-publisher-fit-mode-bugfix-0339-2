@@ -11,6 +11,11 @@ const STATUS_LABEL = {
   failed: '失败',
 }
 
+const FIT_LABEL = {
+  contain: '保留完整裁切区域',
+  cover: '居中裁成方形',
+}
+
 async function api(path, options) {
   const res = await fetch(path, options)
   let body = null
@@ -150,6 +155,7 @@ export default function App() {
           imageId={image.id}
           width={image.width}
           height={image.height}
+          initialFit={image.current_job?.fit || image.current_version?.fit || 'contain'}
           disabled={busy}
           onSubmit={onSubmit}
         />
@@ -160,6 +166,9 @@ export default function App() {
           <h2>当前作业</h2>
           <p>
             状态：<strong>{STATUS_LABEL[job.status] || job.status}</strong>
+            {job.fit && (
+              <span className="crop-info"> · {FIT_LABEL[job.fit] || job.fit}</span>
+            )}
             {job.crop && (
               <span className="crop-info">
                 {' '}
@@ -180,7 +189,8 @@ export default function App() {
         <section className="result">
           <h2>已发布版本 v{image.current_version.version_no}</h2>
           <p className="crop-info">
-            裁切框：x={image.current_version.crop.x}, y={image.current_version.crop.y},
+            适配：{FIT_LABEL[image.current_version.fit] || image.current_version.fit}
+            {' '}· 裁切框：x={image.current_version.crop.x}, y={image.current_version.crop.y},
             w={image.current_version.crop.w}, h={image.current_version.crop.h}
           </p>
           <div className="thumbs">
@@ -201,12 +211,12 @@ export default function App() {
   )
 }
 
-function Cropper({ imageId, width, height, disabled, onSubmit }) {
+function Cropper({ imageId, width, height, initialFit, disabled, onSubmit }) {
   const canvasRef = useRef(null)
   const imgRef = useRef(null)
   const [scale, setScale] = useState(1)
   const [sel, setSel] = useState(null)
-  const [fit, setFit] = useState('contain')
+  const [fit, setFit] = useState(initialFit)
   const dragStart = useRef(null)
 
   const draw = useCallback(() => {

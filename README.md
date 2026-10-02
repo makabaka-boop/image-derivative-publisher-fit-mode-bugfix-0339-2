@@ -50,10 +50,11 @@ docker-compose.yml
 ## 数据模型
 
 - `images`：原图，按 **sha256 内容寻址**，重复上传只产生一条记录。
-- `versions`：对 `(image_id, x, y, w, h)` 唯一。相同原图摘要 + 相同裁切参数
-  永远复用同一个版本；参数变化才产生递增 `version_no` 的新版本。
-- `derivatives`：单张 WebP 派生图，按 `sha256(原图摘要|裁切框|尺寸)` 内容寻址，
-  跨版本/跨作业共享。
+- `versions`：对 `(image_id, x, y, w, h, fit)` 唯一。相同原图摘要 + 相同裁切参数
+  + 相同适配方式（`contain` 保留完整画面 / `cover` 居中方形）永远复用同一个版本；
+  裁切框或适配方式变化才产生递增 `version_no` 的新版本。
+- `derivatives`：单张 WebP 派生图，按 `sha256(原图摘要|裁切框|适配方式|尺寸)`
+  内容寻址，跨版本/跨作业共享。
 - `version_derivatives`：版本 ↔ 256/512 两张派生图（每档唯一）。
 - `jobs`：一次申请。状态机
   `pending → processing → published | cancelled | superseded | failed`。
@@ -65,9 +66,9 @@ docker-compose.yml
 
 申请作业（`POST /api/images/{id}/jobs`）在同一 `BEGIN IMMEDIATE` 事务内：
 
-1. 相同 `(原图摘要, 裁切参数)` 已有版本 → 直接生成一条 `published` 作业并指回该
+1. 相同 `(原图摘要, 裁切参数, fit)` 已有版本 → 直接生成一条 `published` 作业并指回该
    版本（HTTP 200），不进 worker 队列；
-2. 否则同参数已有 `pending/processing` 作业 → 复用该作业（HTTP 202）；
+2. 否则同参数 + 同 fit 已有 `pending/processing` 作业 → 复用该作业（HTTP 202）；
 3. 否则新建 pending 作业（HTTP 202），成为 `current_job_id`；旧已发布版本保留展示。
 
 ### 两尺寸原子发布
@@ -112,6 +113,8 @@ worker 启动时先清空 `tmp/`，再把所有 `processing` 作业无条件退�
 - 裁切：整数、宽高为正、起点非负、`x+w ≤ width`、`y+h ≤ height`，越界 400；
   恰好贴边允许。
 - 输出：裁切框等比缩放到最长边恰为 256/512（小图允许放大），WebP quality 85。
+  `fit=cover` 先在裁切框内居中取最短边方形，再缩放到边长恰为 256/512，
+  两档都严格方形；`fit=contain`（默认）保留完整裁切区域。
 
 ## HTTP 摘要
 
